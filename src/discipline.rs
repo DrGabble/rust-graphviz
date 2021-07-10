@@ -18,8 +18,8 @@ static mut STRING_IO: raw::Agiodisc_t = raw::Agiodisc_t {
     flush: Some(string_flush),
 };
 
-unsafe extern "C" fn string_read(string_ptr: *mut c_void, data_ptr: *mut i8, data_len: i32) -> i32 {
-    0
+unsafe extern "C" fn string_read(_: *mut c_void, _: *mut i8, _: i32) -> i32 {
+    0 // not actually used, simpler to use `raw::agmemread`
 }
 
 unsafe extern "C" fn string_write(string_ptr: *mut c_void, data_ptr: *const i8) -> i32 {
