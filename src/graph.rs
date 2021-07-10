@@ -43,15 +43,17 @@ impl From<String> for Root {
     }
 }
 
-impl Graph for Root {
+impl<'r> GraphInner<'r, 'r> for Root {
     fn inner_mut(&self) -> *mut raw::Agraph_t {
         self.inner.as_ptr()
     }
 
-    fn root(&self) -> &Root {
+    fn root(&'r self) -> &'r Root {
         self
     }
 }
+
+impl<'r> Graph<'r, 'r> for Root {}
 
 impl Root {
     pub fn is_directed(&self) -> bool {
@@ -115,27 +117,38 @@ pub struct Subgraph<'r> {
     root: &'r Root,
 }
 
-impl<'r> Graph for Subgraph<'r> {
+impl<'s, 'r: 's> GraphInner<'s, 'r> for Subgraph<'r> {
     fn inner_mut(&self) -> *mut raw::Agraph_t {
         self.inner.as_ptr()
     }
 
-    fn root(&self) -> &Root {
+    fn root(&'s self) -> &'r Root {
         self.root
     }
 }
 
-///
-/// Traits which are generic over Root and Subgraph
-///
-pub trait Graph: Sized {
+impl<'s, 'r: 's> Graph<'s, 'r> for Subgraph<'r> {}
+
+// Trait to enable Graph trait: seperate so that iterators can be generic over it
+// (cant be generic over Graph because it has generic functions)
+//
+// The two lifetimes is for some shennagians so that Root can return itself with root(),
+// while Subgraph can return a reference to another Root. The end result is that Node<'r>
+// can outlive its parent Subgraph but NOT its arch-parent Root.
+//
+// TODO could be better named
+pub trait GraphInner<'s, 'r: 's> {
     fn inner_mut(&self) -> *mut raw::Agraph_t;
+    fn root(&'s self) -> &'r Root;
+}
 
-    fn root(&self) -> &Root;
-
+///
+/// Traits for functions which are generic over Root and Subgraph
+///
+pub trait Graph<'s, 'r: 's>: GraphInner<'s, 'r> + Sized {
     /// Adds a new subgraph with the given name if it doesn't already exist. If it does already exist,
     /// will just return a handle to that already existing subgraph.
-    fn add_subgraph<N: Into<Vec<u8>>>(&self, name: N) -> Subgraph<'_> {
+    fn add_subgraph<N: Into<Vec<u8>>>(&'s self, name: N) -> Subgraph<'r> {
         let name = to_c_str!(name);
         let name_ptr = name.as_ptr() as *mut i8;
         // UNSAFE name_ptr must be valid for function call, hence name as seperate variable to keep it alive
@@ -149,7 +162,7 @@ pub trait Graph: Sized {
     }
 
     /// Returns a handle to an already existing subgraph if it exists, else returns `None`.
-    fn get_subgraph<N: Into<Vec<u8>>>(&self, name: N) -> Option<Subgraph<'_>> {
+    fn get_subgraph<N: Into<Vec<u8>>>(&'s self, name: N) -> Option<Subgraph<'r>> {
         let name = to_c_str!(name);
         let name_ptr = name.as_ptr() as *mut i8;
         // UNSAFE name_ptr must be valid for function call, hence name as seperate variable to keep it alive
@@ -174,7 +187,7 @@ pub trait Graph: Sized {
 
     /// Adds a new node with the given name if it doesn't already exist. If it does already exist,
     /// will just return a handle to that already existing node.
-    fn add_node_named<N: Into<Vec<u8>>>(&self, name: N) -> Node<'_> {
+    fn add_node_named<N: Into<Vec<u8>>>(&self, name: N) -> Node<'r> {
         let name = to_c_str!(name);
         // UNSAFE name_ptr must be valid for function call, hence name as seperate variable to keep it alive
         // UNSAFE passing cont as mut (library doesn't mark it as const but doesn't actually mutate)
@@ -188,7 +201,7 @@ pub trait Graph: Sized {
     }
 
     /// Returns a handle to an already existing node if it exists, else returns `None`.
-    fn get_node<N: Into<Vec<u8>>>(&self, name: N) -> Option<Node<'_>> {
+    fn get_node<N: Into<Vec<u8>>>(&self, name: N) -> Option<Node<'r>> {
         let name = to_c_str!(name);
         // UNSAFE name_ptr must be valid for function call, hence name as seperate variable to keep it alive
         // UNSAFE passing cont as mut (library doesn't mark it as const but doesn't actually mutate)
@@ -202,7 +215,7 @@ pub trait Graph: Sized {
 
     /// Adds a new anonymous edge with with a generated name, and returns a handle to it.
     /// (In an undirected graph the order of the Nodes is not important).
-    fn add_edge_auto(&self, head: &Node, tail: &Node) -> Edge<'_> {
+    fn add_edge_auto(&self, head: Node, tail: Node) -> Edge<'r> {
         let head = head.inner.as_ptr();
         let tail = tail.inner.as_ptr();
         let name = std::ptr::null_mut();
@@ -217,7 +230,7 @@ pub trait Graph: Sized {
     /// Adds a new edge with the given name between these nodes if it doesn't already exist.
     /// If it does already exist, will just return a handle to that already existing edge.
     /// (In an undirected graph the order of the Nodes is not important).
-    fn add_edge_named<N: Into<Vec<u8>>>(&self, head: &Node, tail: &Node, name: N) -> Edge<'_> {
+    fn add_edge_named<N: Into<Vec<u8>>>(&self, head: Node, tail: Node, name: N) -> Edge<'r> {
         let head = head.inner.as_ptr();
         let tail = tail.inner.as_ptr();
         let name = to_c_str!(name);
@@ -234,7 +247,7 @@ pub trait Graph: Sized {
 
     /// Returns a handle to an already existing edge between these nodes if it exists, else returns `None`.
     /// (In an undirected graph the order of the Nodes is not important).
-    fn get_edge<N: Into<Vec<u8>>>(&self, head: &Node, tail: &Node, name: N) -> Option<Edge<'_>> {
+    fn get_edge<N: Into<Vec<u8>>>(&self, head: Node, tail: Node, name: N) -> Option<Edge<'r>> {
         let head = head.inner.as_ptr();
         let tail = tail.inner.as_ptr();
         let name = to_c_str!(name);
@@ -246,6 +259,14 @@ pub trait Graph: Sized {
             inner,
             root: PhantomData,
         })
+    }
+
+    fn nodes(&'s self) -> NodeIter<'r> {
+        NodeIter::new(self.root())
+    }
+
+    fn edges(&'s self, node: Node<'r>) -> EdgeIter<'r> {
+        EdgeIter::new(self.root(), node)
     }
 }
 
@@ -271,6 +292,37 @@ impl<'r> Node<'r> {
 }
 
 ///
+/// Iterator for traversing all Nodes in a Graph
+///
+pub struct NodeIter<'r> {
+    root: &'r Root,
+    next_node: *mut raw::Agnode_t,
+}
+
+impl<'r> NodeIter<'r> {
+    fn new(root: &'r Root) -> Self {
+        let next_node = unsafe { raw::agfstnode(root.inner_mut()) };
+        Self { root, next_node }
+    }
+}
+
+impl<'r> Iterator for NodeIter<'r> {
+    type Item = Node<'r>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(inner) = NonNull::new(self.next_node) {
+            self.next_node = unsafe { raw::agnxtnode(self.root.inner_mut(), self.next_node) };
+            Some(Node {
+                inner,
+                root: PhantomData,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+///
 /// Edge
 ///
 #[derive(Copy, Clone)]
@@ -288,6 +340,48 @@ impl<'r> Edge<'r> {
         assert!(!string_ptr.is_null(), "Couldnt get name of edge");
         let c_string = unsafe { CStr::from_ptr(string_ptr) };
         c_string.to_str().unwrap()
+    }
+}
+
+///
+/// Iterator for traversing the Edges of a Node
+///
+pub struct EdgeIter<'r> {
+    root: &'r Root,
+    node: Node<'r>,
+    next_edge: *mut raw::Agedge_t,
+}
+
+impl<'r> EdgeIter<'r> {
+    fn new(root: &'r Root, node: Node<'r>) -> Self {
+        let next_edge = unsafe { raw::agfstedge(root.inner_mut(), node.inner.as_ptr()) };
+        Self {
+            root,
+            node,
+            next_edge,
+        }
+    }
+}
+
+impl<'r> Iterator for EdgeIter<'r> {
+    type Item = Edge<'r>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(inner) = NonNull::new(self.next_edge) {
+            self.next_edge = unsafe {
+                raw::agnxtedge(
+                    self.root.inner_mut(),
+                    self.next_edge,
+                    self.node.inner.as_ptr(),
+                )
+            };
+            Some(Edge {
+                inner,
+                root: PhantomData,
+            })
+        } else {
+            None
+        }
     }
 }
 
@@ -353,7 +447,29 @@ mod test {
         let graph = Root::new(GraphType::Undirected);
         let head = graph.add_node_named("head");
         let tail = graph.add_node_named("tail");
-        graph.add_edge_named(&head, &tail, "edge");
+        graph.add_edge_named(head, tail, "edge");
         assert_eq!("graph {head -- tail[key=\"edge\"];}", to_output(&graph));
+    }
+
+    #[test]
+    fn test_node_and_edge_iterator() {
+        let graph = Root::new(GraphType::Directed);
+        let sub = graph.add_subgraph("sub");
+
+        let alpha = sub.add_node_named("alpha");
+        let beta = sub.add_node_named("beta");
+        let gamma = sub.add_node_named("gamma");
+        let mut nodes = graph.nodes();
+        assert_eq!(nodes.next().unwrap().name(), "alpha");
+        assert_eq!(nodes.next().unwrap().name(), "beta");
+        assert_eq!(nodes.next().unwrap().name(), "gamma");
+
+        sub.add_edge_named(alpha, beta, "one");
+        sub.add_edge_named(beta, alpha, "two");
+        sub.add_edge_named(alpha, gamma, "three");
+        let mut edges = graph.edges(alpha);
+        assert_eq!(edges.next().unwrap().name(), "one");
+        assert_eq!(edges.next().unwrap().name(), "three");
+        assert_eq!(edges.next().unwrap().name(), "two");
     }
 }
