@@ -261,12 +261,24 @@ pub trait Graph<'s, 'r: 's>: GraphInner<'s, 'r> + Sized {
         })
     }
 
-    fn nodes(&'s self) -> NodeIter<'r> {
-        NodeIter::new(self.root())
+    /// Returns an iterator through all nodes in the Graph
+    fn nodes(&'s self) -> NodeIter<'s, 'r> {
+        NodeIter::new(self)
     }
 
+    /// Returns an iterator through all edges connected to the Node.
     fn edges(&'s self, node: Node<'r>) -> EdgeIter<'r> {
-        EdgeIter::new(self.root(), node)
+        EdgeIter::new(self.root(), node, Direction::Undirected)
+    }
+
+    /// Returns an iterator through all inbound edges going to the Node.
+    fn edges_inbound(&'s self, node: Node<'r>) -> EdgeIter<'r> {
+        EdgeIter::new(self.root(), node, Direction::Inbound)
+    }
+
+    /// Returns an iterator through all outbound edges going from the Node.
+    fn edges_outbound(&'s self, node: Node<'r>) -> EdgeIter<'r> {
+        EdgeIter::new(self.root(), node, Direction::Outbound)
     }
 }
 
@@ -291,27 +303,33 @@ impl<'r> Node<'r> {
     }
 }
 
-///
-/// Iterator for traversing all Nodes in a Graph
-///
-pub struct NodeIter<'r> {
-    root: &'r Root,
-    next_node: *mut raw::Agnode_t,
-}
-
-impl<'r> NodeIter<'r> {
-    fn new(root: &'r Root) -> Self {
-        let next_node = unsafe { raw::agfstnode(root.inner_mut()) };
-        Self { root, next_node }
+impl<'r> std::fmt::Debug for Node<'r> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Node").field(&self.name()).finish()
     }
 }
 
-impl<'r> Iterator for NodeIter<'r> {
+///
+/// Iterator for traversing all Nodes in a Graph. See [`Graph::nodes`].
+///
+pub struct NodeIter<'s, 'r> {
+    graph: &'s dyn GraphInner<'s, 'r>,
+    next_node: *mut raw::Agnode_t,
+}
+
+impl<'s, 'r> NodeIter<'s, 'r> {
+    fn new(graph: &'s dyn GraphInner<'s, 'r>) -> Self {
+        let next_node = unsafe { raw::agfstnode(graph.inner_mut()) };
+        Self { graph, next_node }
+    }
+}
+
+impl<'s, 'r> Iterator for NodeIter<'s, 'r> {
     type Item = Node<'r>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(inner) = NonNull::new(self.next_node) {
-            self.next_node = unsafe { raw::agnxtnode(self.root.inner_mut(), self.next_node) };
+            self.next_node = unsafe { raw::agnxtnode(self.graph.inner_mut(), self.next_node) };
             Some(Node {
                 inner,
                 root: PhantomData,
@@ -325,7 +343,7 @@ impl<'r> Iterator for NodeIter<'r> {
 ///
 /// Edge
 ///
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Eq)]
 pub struct Edge<'r> {
     // NOTE: this is NOT an owning pointer
     inner: NonNull<raw::Agedge_t>,
@@ -341,24 +359,85 @@ impl<'r> Edge<'r> {
         let c_string = unsafe { CStr::from_ptr(string_ptr) };
         c_string.to_str().unwrap()
     }
+
+    pub fn tail(&self) -> Node<'r> {
+        let edge = match self.is_out_edge() {
+            true => self.get_twin(),
+            false => *self,
+        };
+        let node_ptr = unsafe { edge.inner.as_ref() }.node;
+        let inner = NonNull::new(node_ptr).expect("Edge node invalid");
+        Node {
+            inner,
+            root: PhantomData,
+        }
+    }
+
+    pub fn head(&self) -> Node<'r> {
+        let edge = match self.is_out_edge() {
+            true => *self,
+            false => self.get_twin(),
+        };
+        let node_ptr = unsafe { edge.inner.as_ref() }.node;
+        let inner = NonNull::new(node_ptr).expect("Edge node invalid");
+        Node {
+            inner,
+            root: PhantomData,
+        }
+    }
+
+    fn get_twin(&self) -> Self {
+        // UNSAFE cgraph garuantees that edges come in pairs next to eachother
+        let edge_ptr = match self.is_out_edge() {
+            true => unsafe { self.inner.as_ptr().offset(1) },
+            false => unsafe { self.inner.as_ptr().offset(-1) },
+        };
+        let inner = NonNull::new(edge_ptr).expect("Edge twin is invalid");
+        Self {
+            inner,
+            root: PhantomData,
+        }
+    }
+
+    fn is_out_edge(&self) -> bool {
+        unsafe { self.inner.as_ref() }.base.tag.objtype() == raw::AGOUTEDGE
+    }
+}
+
+impl<'r> std::fmt::Debug for Edge<'r> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Edge").field(&self.name()).finish()
+    }
+}
+
+impl<'r> PartialEq for Edge<'r> {
+    fn eq(&self, other: &Self) -> bool {
+        match self.is_out_edge() == other.is_out_edge() {
+            true => self.inner == other.inner,
+            false => self.get_twin().inner == other.inner,
+        }
+    }
 }
 
 ///
-/// Iterator for traversing the Edges of a Node
+/// Iterator for traversing the Edges of a Node. See [`Graph::edges`],
+/// [`Graph::edges_inbound`] or [`Graph::edges_outbound`] for more.
 ///
 pub struct EdgeIter<'r> {
     root: &'r Root,
     node: Node<'r>,
     next_edge: *mut raw::Agedge_t,
+    direction: Direction,
 }
 
 impl<'r> EdgeIter<'r> {
-    fn new(root: &'r Root, node: Node<'r>) -> Self {
-        let next_edge = unsafe { raw::agfstedge(root.inner_mut(), node.inner.as_ptr()) };
+    fn new(root: &'r Root, node: Node<'r>, direction: Direction) -> Self {
+        let next_edge = unsafe { direction.first_edge(root, node) };
         Self {
             root,
             node,
             next_edge,
+            direction,
         }
     }
 }
@@ -369,11 +448,8 @@ impl<'r> Iterator for EdgeIter<'r> {
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(inner) = NonNull::new(self.next_edge) {
             self.next_edge = unsafe {
-                raw::agnxtedge(
-                    self.root.inner_mut(),
-                    self.next_edge,
-                    self.node.inner.as_ptr(),
-                )
+                self.direction
+                    .next_edge(self.root, self.next_edge, self.node)
             };
             Some(Edge {
                 inner,
@@ -381,6 +457,35 @@ impl<'r> Iterator for EdgeIter<'r> {
             })
         } else {
             None
+        }
+    }
+}
+
+pub enum Direction {
+    Undirected,
+    Inbound,
+    Outbound,
+}
+
+impl Direction {
+    unsafe fn first_edge(&self, root: &Root, node: Node) -> *mut raw::Agedge_t {
+        match self {
+            Self::Undirected => raw::agfstedge(root.inner_mut(), node.inner.as_ptr()),
+            Self::Inbound => raw::agfstin(root.inner_mut(), node.inner.as_ptr()),
+            Self::Outbound => raw::agfstout(root.inner_mut(), node.inner.as_ptr()),
+        }
+    }
+
+    unsafe fn next_edge(
+        &self,
+        root: &Root,
+        edge: *mut raw::Agedge_t,
+        node: Node,
+    ) -> *mut raw::Agedge_t {
+        match self {
+            Self::Undirected => raw::agnxtedge(root.inner_mut(), edge, node.inner.as_ptr()),
+            Self::Inbound => raw::agnxtin(root.inner_mut(), edge),
+            Self::Outbound => raw::agnxtout(root.inner_mut(), edge),
         }
     }
 }
@@ -452,24 +557,64 @@ mod test {
     }
 
     #[test]
-    fn test_node_and_edge_iterator() {
+    fn test_nodes_and_edges_iterators() {
         let graph = Root::new(GraphType::Directed);
         let sub = graph.add_subgraph("sub");
+        let other_sub = graph.add_subgraph("other_sub");
 
         let alpha = sub.add_node_named("alpha");
         let beta = sub.add_node_named("beta");
         let gamma = sub.add_node_named("gamma");
-        let mut nodes = graph.nodes();
-        assert_eq!(nodes.next().unwrap().name(), "alpha");
-        assert_eq!(nodes.next().unwrap().name(), "beta");
-        assert_eq!(nodes.next().unwrap().name(), "gamma");
 
-        sub.add_edge_named(alpha, beta, "one");
-        sub.add_edge_named(beta, alpha, "two");
-        sub.add_edge_named(alpha, gamma, "three");
-        let mut edges = graph.edges(alpha);
-        assert_eq!(edges.next().unwrap().name(), "one");
-        assert_eq!(edges.next().unwrap().name(), "three");
-        assert_eq!(edges.next().unwrap().name(), "two");
+        {
+            let nodes = [alpha, beta, gamma];
+            let all_nodes: Vec<_> = graph.nodes().collect();
+            let sub_nodes: Vec<_> = sub.nodes().collect();
+            let other_nodes: Vec<_> = other_sub.nodes().collect();
+            assert_eq!(all_nodes, nodes);
+            assert_eq!(sub_nodes, nodes);
+            assert_eq!(other_nodes, []);
+        }
+
+        let one = sub.add_edge_named(alpha, beta, "one");
+        let two = sub.add_edge_named(beta, alpha, "two");
+        let three = sub.add_edge_named(alpha, gamma, "three");
+
+        {
+            let undirected: Vec<_> = graph.edges(alpha).collect();
+            let inbound: Vec<_> = graph.edges_inbound(alpha).collect();
+            let outbound: Vec<_> = graph.edges_outbound(alpha).collect();
+            assert_eq!(undirected, [one, three, two]);
+            assert_eq!(inbound, [two]);
+            assert_eq!(outbound, [one, three]);
+        }
+
+        {
+            let undirected: Vec<_> = other_sub.edges(alpha).collect();
+            let inbound: Vec<_> = other_sub.edges_inbound(alpha).collect();
+            let outbound: Vec<_> = other_sub.edges_outbound(alpha).collect();
+            assert_eq!(undirected, [one, three, two]);
+            assert_eq!(inbound, [two]);
+            assert_eq!(outbound, [one, three]);
+        }
+    }
+
+    #[test]
+    fn test_undirected_edges_iterator() {
+        let graph = Root::new(GraphType::Undirected);
+
+        let alpha = graph.add_node_named("alpha");
+        let beta = graph.add_node_named("beta");
+        let gamma = graph.add_node_named("gamma");
+        let one = graph.add_edge_named(alpha, beta, "one");
+        let two = graph.add_edge_named(beta, alpha, "two");
+        let three = graph.add_edge_named(alpha, gamma, "three");
+
+        let undirected: Vec<_> = graph.edges(alpha).collect();
+        let inbound: Vec<_> = graph.edges_inbound(alpha).collect();
+        let outbound: Vec<_> = graph.edges_outbound(alpha).collect();
+        assert_eq!(undirected, [one, three, two]);
+        assert_eq!(inbound, [two]);
+        assert_eq!(outbound, [one, three]);
     }
 }
